@@ -2,6 +2,7 @@ package com.alamkanak.weekview
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.RectF
 import android.graphics.Typeface
@@ -10,8 +11,10 @@ import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
 import android.view.accessibility.AccessibilityManager
+import androidx.annotation.RequiresApi
 import androidx.core.view.ViewCompat
 import java.util.Calendar
+import kotlin.math.ceil
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -25,30 +28,55 @@ class WeekView @JvmOverloads constructor(
         ViewStateFactory.create(context, attrs)
     }
 
-    private val eventChipsCache = EventChipsCache()
+    private val eventChipsCacheProvider: EventChipsCacheProvider = { adapter?.eventChipsCache }
 
     private val touchHandler = WeekViewTouchHandler(viewState)
+
+    private val navigationListener = object : Navigator.NavigationListener {
+        override fun onHorizontalScrollPositionChanged() {
+            invalidate()
+        }
+
+        override fun onHorizontalScrollingFinished() {
+            notifyRangeChangedListener()
+        }
+
+        override fun onVerticalScrollPositionChanged() {
+            invalidate()
+        }
+
+        override fun requestInvalidation() {
+            ViewCompat.postInvalidateOnAnimation(this@WeekView)
+        }
+    }
+
+    private val navigator = Navigator(viewState = viewState, listener = navigationListener)
+
     private val gestureHandler = WeekViewGestureHandler(
         context = context,
         viewState = viewState,
         touchHandler = touchHandler,
-        onInvalidation = { ViewCompat.postInvalidateOnAnimation(this) }
+        navigator = navigator
     )
 
     private var accessibilityTouchHelper = WeekViewAccessibilityTouchHelper(
         view = this,
         viewState = viewState,
         touchHandler = touchHandler,
-        eventChipsCache = eventChipsCache
+        eventChipsCacheProvider = eventChipsCacheProvider
     )
-
-    private val scroller = ValueAnimator()
 
     private val renderers: List<Renderer> = listOf(
         TimeColumnRenderer(viewState),
-        CalendarRenderer(viewState, eventChipsCache),
-        HeaderRenderer(viewState, eventChipsCache)
+        CalendarRenderer(viewState, eventChipsCacheProvider),
+        HeaderRenderer(context, viewState, eventChipsCacheProvider, onHeaderHeightChanged = this::invalidate)
     )
+
+    // We use width and height instead of view.isLaidOut(), because the latter seems to
+    // struggle when used in a ViewPager.
+    // See: https://github.com/thellmund/Android-Week-View/issues/214
+    private val isWaitingToBeLaidOut: Boolean
+        get() = width <= 0 || height <= 0
 
     init {
         val accessibilityManager =
@@ -65,11 +93,15 @@ class WeekView @JvmOverloads constructor(
         setLayerType(LAYER_TYPE_SOFTWARE, null)
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        viewState.onConfigurationChanged(newConfig)
+        super.onConfigurationChanged(newConfig)
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         performPendingScrolls()
-        updateDataHolders()
-        notifyScrollListeners()
+        updateViewState()
         refreshEvents()
         performRendering(canvas)
     }
@@ -88,8 +120,8 @@ class WeekView @JvmOverloads constructor(
         }
     }
 
-    private fun updateDataHolders() {
-        viewState.update()
+    private fun updateViewState() {
+        viewState.update(navigationListener = navigationListener)
     }
 
     private fun refreshEvents() {
@@ -97,8 +129,8 @@ class WeekView @JvmOverloads constructor(
             return
         }
 
-        val pagedAdapter = adapter as? PagingAdapter ?: return
-        pagedAdapter.loadPeriodsIfNecessary()
+        val pagingAdapter = adapter as? PagingAdapter
+        pagingAdapter?.dispatchLoadRequest()
     }
 
     private fun performRendering(canvas: Canvas) {
@@ -131,22 +163,34 @@ class WeekView @JvmOverloads constructor(
         renderers.forEach { it.onSizeChanged(width, height) }
     }
 
-    private fun notifyScrollListeners() {
-        val oldFirstVisibleDay = viewState.firstVisibleDate
+    private fun updateDateRange(): List<Calendar> {
         val daysScrolled = viewState.currentOrigin.x / viewState.dayWidth
         val delta = daysScrolled.roundToInt() * (-1)
 
-        val firstVisibleDate = today() + Days(delta)
-        val visibleDays = viewState.numberOfVisibleDays
+        val firstVisibleDate = if (viewState.isLtr) {
+            today() + Days(delta)
+        } else {
+            today() - Days(delta)
+        }
 
-        val dateRange = firstVisibleDate.rangeWithDays(visibleDays)
-        val adjustedDateRange = dateRange.limitTo(viewState.minDate, viewState.maxDate)
-        viewState.firstVisibleDate = adjustedDateRange.first()
+        val dateRange = viewState.createDateRange(firstVisibleDate)
+        return dateRange.validate(viewState = viewState)
+    }
 
-        val hasFirstVisibleDayChanged = oldFirstVisibleDay.toEpochDays() != firstVisibleDate.toEpochDays()
-        if (hasFirstVisibleDayChanged && !scroller.isRunning) {
-            val lastVisibleDate = adjustedDateRange.last()
-            adapter?.onRangeChanged(firstVisibleDate, lastVisibleDate)
+    private fun notifyRangeChangedListener() {
+        val currentFirstVisibleDate = viewState.firstVisibleDate
+        val newDateRange = updateDateRange()
+        val newFirstVisibleDate = newDateRange.first()
+
+        val didFirstVisibleDateChange = !currentFirstVisibleDate.isSameDate(newFirstVisibleDate)
+        viewState.firstVisibleDate = newFirstVisibleDate
+
+        if (didFirstVisibleDateChange && navigator.isNotRunning) {
+            val newLastVisibleDate = newDateRange.last()
+            adapter?.onRangeChanged(
+                firstVisibleDate = newFirstVisibleDate,
+                lastVisibleDate = newLastVisibleDate
+            )
         }
     }
 
@@ -165,23 +209,40 @@ class WeekView @JvmOverloads constructor(
     var numberOfVisibleDays: Int
         get() = viewState.numberOfVisibleDays
         set(value) {
+            val currentFirstVisibleDate = viewState.firstVisibleDate
             viewState.numberOfVisibleDays = value
+
             dateTimeInterpreter.onSetNumberOfDays(value)
             renderers.filterIsInstance(DateFormatterDependent::class.java).forEach {
                 it.onDateFormatterChanged(viewState.dateFormatter)
             }
+
+            val newOrigin = viewState.getXOriginForDate(currentFirstVisibleDate)
+            viewState.currentOrigin.x = newOrigin
             invalidate()
         }
 
     /**
-     * Returns whether the first day of the week should be displayed at the left-most position
-     * when WeekView is displayed for the first time.
+     * Returns whether the first day of the week should be displayed at the start position
+     * when WeekView is rendered for the first time.
      */
     @PublicApi
-    var isShowFirstDayOfWeekFirst: Boolean
+    var showFirstDayOfWeekFirst: Boolean
         get() = viewState.showFirstDayOfWeekFirst
         set(value) {
             viewState.showFirstDayOfWeekFirst = value
+        }
+
+    /**
+     * Returns whether all-day events are arranged vertically. If false, all-day events are shown
+     * in a horizontal arrangement, occupying only a single row.
+     */
+    @PublicApi
+    var arrangeAllDayEventsVertically: Boolean
+        get() = viewState.arrangeAllDayEventsVertically
+        set(value) {
+            viewState.arrangeAllDayEventsVertically = value
+            invalidate()
         }
 
     /*
@@ -196,10 +257,10 @@ class WeekView @JvmOverloads constructor(
      * Returns whether a horizontal line should be displayed at the bottom of the header row.
      */
     @PublicApi
-    var isShowHeaderRowBottomLine: Boolean
-        get() = viewState.showHeaderRowBottomLine
+    var showHeaderBottomLine: Boolean
+        get() = viewState.showHeaderBottomLine
         set(value) {
-            viewState.showHeaderRowBottomLine = value
+            viewState.showHeaderBottomLine = value
             invalidate()
         }
 
@@ -207,10 +268,10 @@ class WeekView @JvmOverloads constructor(
      * Returns the color of the horizontal line at the bottom of the header row.
      */
     @PublicApi
-    var headerRowBottomLineColor: Int
-        get() = viewState.headerRowBottomLinePaint.color
+    var headerBottomLineColor: Int
+        get() = viewState.headerBottomLinePaint.color
         set(value) {
-            viewState.headerRowBottomLinePaint.color = value
+            viewState.headerBottomLinePaint.color = value
             invalidate()
         }
 
@@ -218,10 +279,55 @@ class WeekView @JvmOverloads constructor(
      * Returns the stroke width of the horizontal line at the bottom of the header row.
      */
     @PublicApi
-    var headerRowBottomLineWidth: Int
-        get() = viewState.headerRowBottomLinePaint.strokeWidth.toInt()
+    var headerBottomLineWidth: Int
+        get() = viewState.headerBottomLinePaint.strokeWidth.toInt()
         set(value) {
-            viewState.headerRowBottomLinePaint.strokeWidth = value.toFloat()
+            viewState.headerBottomLinePaint.strokeWidth = value.toFloat()
+            invalidate()
+        }
+
+    /*
+     ***********************************************************************************************
+     *
+     *   Header bottom shadow
+     *
+     ***********************************************************************************************
+     */
+
+    /**
+     * Returns whether a shadow should be displayed at the bottom of the header row.
+     */
+    @PublicApi
+    var showHeaderBottomShadow: Boolean
+        get() = viewState.showHeaderBottomShadow
+        set(value) {
+            viewState.showHeaderBottomShadow = value
+            invalidate()
+        }
+
+    /**
+     * Returns the color of the shadow at the bottom of the header row.
+     */
+    @PublicApi
+    var headerBottomShadowColor: Int
+        @RequiresApi(api = 29)
+        get() = viewState.headerBackgroundWithShadowPaint.shadowLayerColor
+        set(value) {
+            val paint = viewState.headerBackgroundWithShadowPaint
+            paint.setShadowLayer(headerBottomShadowRadius.toFloat(), 0f, 0f, value)
+            invalidate()
+        }
+
+    /**
+     * Returns the radius of the shadow at the bottom of the header row.
+     */
+    @PublicApi
+    var headerBottomShadowRadius: Int
+        @RequiresApi(api = 29)
+        get() = viewState.headerBackgroundWithShadowPaint.shadowLayerRadius.roundToInt()
+        set(value) {
+            val paint = viewState.headerBackgroundWithShadowPaint
+            paint.setShadowLayer(value.toFloat(), 0f, 0f, headerBottomShadowColor)
             invalidate()
         }
 
@@ -270,22 +376,10 @@ class WeekView @JvmOverloads constructor(
      * Returns the text size of the labels in the time column.
      */
     @PublicApi
-    var timeColumnTextSize: Float
-        get() = viewState.timeColumnTextPaint.textSize
+    var timeColumnTextSize: Int
+        get() = viewState.timeColumnTextPaint.textSize.roundToInt()
         set(value) {
-            viewState.timeColumnTextPaint.textSize = value
-            invalidate()
-        }
-
-    /**
-     * Returns whether the label for the midnight hour is displayed in the time column. This setting
-     * is only considered if [showTimeColumnHourSeparators] is set to true.
-     */
-    @PublicApi
-    var isShowMidnightHour: Boolean
-        get() = viewState.showMidnightHour
-        set(value) {
-            viewState.showMidnightHour = value
+            viewState.timeColumnTextPaint.textSize = value.toFloat()
             invalidate()
         }
 
@@ -320,10 +414,10 @@ class WeekView @JvmOverloads constructor(
      */
 
     /**
-     * Returns whether a vertical line is displayed at the end of the time column.
+     * Returns whether a vertical line is displayed between the time column and the calendar grid.
      */
     @PublicApi
-    var isShowTimeColumnSeparator: Boolean
+    var showTimeColumnSeparator: Boolean
         get() = viewState.showTimeColumnSeparator
         set(value) {
             viewState.showTimeColumnSeparator = value
@@ -345,10 +439,10 @@ class WeekView @JvmOverloads constructor(
      * Returns the stroke width of the time column separator.
      */
     @PublicApi
-    var timeColumnSeparatorWidth: Float
-        get() = viewState.timeColumnSeparatorPaint.strokeWidth
+    var timeColumnSeparatorWidth: Int
+        get() = viewState.timeColumnSeparatorPaint.strokeWidth.roundToInt()
         set(value) {
-            viewState.timeColumnSeparatorPaint.strokeWidth = value
+            viewState.timeColumnSeparatorPaint.strokeWidth = value.toFloat()
             invalidate()
         }
 
@@ -364,10 +458,10 @@ class WeekView @JvmOverloads constructor(
      * Returns the header row padding, which is applied above and below the all-day event chips.
      */
     @PublicApi
-    var headerRowPadding: Float
-        get() = viewState.headerRowPadding
+    var headerPadding: Int
+        get() = viewState.headerPadding.roundToInt()
         set(value) {
-            viewState.headerRowPadding = value
+            viewState.headerPadding = value.toFloat()
             invalidate()
         }
 
@@ -375,10 +469,10 @@ class WeekView @JvmOverloads constructor(
      * Returns the header row background color.
      */
     @PublicApi
-    var headerRowBackgroundColor: Int
-        get() = viewState.headerRowBackgroundPaint.color
+    var headerBackgroundColor: Int
+        get() = viewState.headerBackgroundPaint.color
         set(value) {
-            viewState.headerRowBackgroundPaint.color = value
+            viewState.headerBackgroundPaint.color = value
             invalidate()
         }
 
@@ -386,10 +480,10 @@ class WeekView @JvmOverloads constructor(
      * Returns the text color used for all date labels except today.
      */
     @PublicApi
-    var headerRowTextColor: Int
-        get() = viewState.headerRowTextPaint.color
+    var headerTextColor: Int
+        get() = viewState.headerTextPaint.color
         set(value) {
-            viewState.headerRowTextPaint.color = value
+            viewState.headerTextPaint.color = value
             invalidate()
         }
 
@@ -405,13 +499,89 @@ class WeekView @JvmOverloads constructor(
         }
 
     /**
+     * Returns the text color used for weekend date labels.
+     */
+    @PublicApi
+    var weekendHeaderTextColor: Int
+        get() = viewState.weekendHeaderTextPaint.color
+        set(value) {
+            viewState.weekendHeaderTextPaint.color = value
+            invalidate()
+        }
+
+    /**
      * Returns the text size of all date labels.
      */
     @PublicApi
-    var headerRowTextSize: Float
-        get() = viewState.headerRowTextPaint.textSize
+    var headerTextSize: Int
+        get() = viewState.headerTextPaint.textSize.roundToInt()
         set(value) {
-            viewState.headerRowTextPaint.textSize = value
+            viewState.headerTextPaint.textSize = value.toFloat()
+            viewState.todayHeaderTextPaint.textSize = value.toFloat()
+            viewState.weekendHeaderTextPaint.textSize = value.toFloat()
+            invalidate()
+        }
+
+    /*
+     ***********************************************************************************************
+     *
+     *   Week number
+     *
+     ***********************************************************************************************
+     */
+
+    /**
+     * Returns whether the current week number is displayed in the header.
+     */
+    @PublicApi
+    var showWeekNumber: Boolean
+        get() = viewState.showWeekNumber
+        set(value) {
+            viewState.showWeekNumber = value
+            invalidate()
+        }
+
+    /**
+     * Returns the text color of the week number.
+     */
+    @PublicApi
+    var weekNumberTextColor: Int
+        get() = viewState.weekNumberTextPaint.color
+        set(value) {
+            viewState.weekNumberTextPaint.color = value
+            invalidate()
+        }
+
+    /**
+     * Returns the text size of the week number.
+     */
+    @PublicApi
+    var weekNumberTextSize: Int
+        get() = viewState.weekNumberTextPaint.textSize.toInt()
+        set(value) {
+            viewState.weekNumberTextPaint.textSize = value.toFloat()
+            invalidate()
+        }
+
+    /**
+     * Returns the color of the week number's background.
+     */
+    @PublicApi
+    var weekNumberBackgroundColor: Int
+        get() = viewState.weekNumberBackgroundPaint.color
+        set(value) {
+            viewState.weekNumberTextPaint.color = value
+            invalidate()
+        }
+
+    /**
+     * Returns the corner radius of the week number's background.
+     */
+    @PublicApi
+    var weekNumberBackgroundCornerRadius: Int
+        get() = viewState.weekNumberBackgroundCornerRadius.roundToInt()
+        set(value) {
+            viewState.weekNumberBackgroundCornerRadius = value.toFloat()
             invalidate()
         }
 
@@ -438,10 +608,10 @@ class WeekView @JvmOverloads constructor(
      * Returns the text size of a single-event [EventChip].
      */
     @PublicApi
-    var eventTextSize: Float
-        get() = viewState.eventTextPaint.textSize
+    var eventTextSize: Int
+        get() = viewState.eventTextPaint.textSize.roundToInt()
         set(value) {
-            viewState.eventTextPaint.textSize = value
+            viewState.eventTextPaint.textSize = value.toFloat()
             invalidate()
         }
 
@@ -460,10 +630,10 @@ class WeekView @JvmOverloads constructor(
      * Returns the text size of an all-day [EventChip].
      */
     @PublicApi
-    var allDayEventTextSize: Float
-        get() = viewState.allDayEventTextPaint.textSize
+    var allDayEventTextSize: Int
+        get() = viewState.allDayEventTextPaint.textSize.roundToInt()
         set(value) {
-            viewState.allDayEventTextPaint.textSize = value
+            viewState.allDayEventTextPaint.textSize = value.toFloat()
             invalidate()
         }
 
@@ -501,7 +671,7 @@ class WeekView @JvmOverloads constructor(
         }
 
     /**
-     * Returns the default text color of an [EventChip].
+     * Returns the default background color of an [EventChip].
      */
     @PublicApi
     var defaultEventColor: Int
@@ -553,14 +723,13 @@ class WeekView @JvmOverloads constructor(
         }
 
     /**
-     * Returns the horizontal margin of an [EventChip]. This margin is only applied in single-day
-     * view and if there are no overlapping events.
+     * Returns the horizontal padding used in single-day view.
      */
     @PublicApi
-    var eventMarginHorizontal: Int
-        get() = viewState.eventMarginHorizontal
+    var singleDayHorizontalPadding: Int
+        get() = viewState.singleDayHorizontalPadding
         set(value) {
-            viewState.eventMarginHorizontal = value
+            viewState.singleDayHorizontalPadding = value
             invalidate()
         }
 
@@ -591,35 +760,6 @@ class WeekView @JvmOverloads constructor(
         get() = viewState.todayBackgroundPaint.color
         set(value) {
             viewState.todayBackgroundPaint.color = value
-            invalidate()
-        }
-
-    /**
-     * Returns whether weekends should have a background color different from [dayBackgroundColor].
-     *
-     * The weekend background colors can be defined by [pastWeekendBackgroundColor] and
-     * [futureWeekendBackgroundColor].
-     */
-    @PublicApi
-    var isShowDistinctWeekendColor: Boolean
-        get() = viewState.showDistinctWeekendColor
-        set(value) {
-            viewState.showDistinctWeekendColor = value
-            invalidate()
-        }
-
-    /**
-     * Returns whether past and future days should have background colors different from
-     * [dayBackgroundColor].
-     *
-     * The past and future day colors can be defined by [pastBackgroundColor] and
-     * [futureBackgroundColor].
-     */
-    @PublicApi
-    var isShowDistinctPastFutureColor: Boolean
-        get() = viewState.showDistinctPastFutureColor
-        set(value) {
-            viewState.showDistinctPastFutureColor = value
             invalidate()
         }
 
@@ -683,10 +823,10 @@ class WeekView @JvmOverloads constructor(
      * Returns the current height of an hour.
      */
     @PublicApi
-    var hourHeight: Float
-        get() = viewState.hourHeight
+    var hourHeight: Int
+        get() = viewState.hourHeight.roundToInt()
         set(value) {
-            viewState.newHourHeight = value
+            viewState.newHourHeight = value.toFloat()
             invalidate()
         }
 
@@ -694,10 +834,10 @@ class WeekView @JvmOverloads constructor(
      * Returns the minimum height of an hour.
      */
     @PublicApi
-    var minHourHeight: Float
-        get() = viewState.minHourHeight
+    var minHourHeight: Int
+        get() = viewState.minHourHeight.roundToInt()
         set(value) {
-            viewState.minHourHeight = value
+            viewState.minHourHeight = value.toFloat()
             invalidate()
         }
 
@@ -705,10 +845,10 @@ class WeekView @JvmOverloads constructor(
      * Returns the maximum height of an hour.
      */
     @PublicApi
-    var maxHourHeight: Float
-        get() = viewState.maxHourHeight
+    var maxHourHeight: Int
+        get() = viewState.maxHourHeight.roundToInt()
         set(value) {
-            viewState.maxHourHeight = value
+            viewState.maxHourHeight = value.toFloat()
             invalidate()
         }
 
@@ -717,7 +857,7 @@ class WeekView @JvmOverloads constructor(
      * adjusts to accommodate all hours between [minHour] and [maxHour].
      */
     @PublicApi
-    var isShowCompleteDay: Boolean
+    var showCompleteDay: Boolean
         get() = viewState.showCompleteDay
         set(value) {
             viewState.showCompleteDay = value
@@ -736,7 +876,7 @@ class WeekView @JvmOverloads constructor(
      * Returns whether a horizontal line should be displayed at the current time.
      */
     @PublicApi
-    var isShowNowLine: Boolean
+    var showNowLine: Boolean
         get() = viewState.showNowLine
         set(value) {
             viewState.showNowLine = value
@@ -758,19 +898,19 @@ class WeekView @JvmOverloads constructor(
      * Returns the stroke width of the horizontal "now" line.
      */
     @PublicApi
-    var nowLineStrokeWidth: Float
-        get() = viewState.nowLinePaint.strokeWidth
+    var nowLineStrokeWidth: Int
+        get() = viewState.nowLinePaint.strokeWidth.roundToInt()
         set(value) {
-            viewState.nowLinePaint.strokeWidth = value
+            viewState.nowLinePaint.strokeWidth = value.toFloat()
             invalidate()
         }
 
     /**
      * Returns whether a dot at the start of the "now" line is displayed. The dot is only displayed
-     * if [isShowNowLine] is set to true.
+     * if [showNowLine] is set to true.
      */
     @PublicApi
-    var isShowNowLineDot: Boolean
+    var showNowLineDot: Boolean
         get() = viewState.showNowLineDot
         set(value) {
             viewState.showNowLineDot = value
@@ -792,10 +932,10 @@ class WeekView @JvmOverloads constructor(
      * Returns the radius of the dot at the start of the "now" line.
      */
     @PublicApi
-    var nowLineDotRadius: Float
-        get() = viewState.nowDotPaint.strokeWidth
+    var nowLineDotRadius: Int
+        get() = viewState.nowDotPaint.strokeWidth.roundToInt()
         set(value) {
-            viewState.nowDotPaint.strokeWidth = value
+            viewState.nowDotPaint.strokeWidth = value.toFloat()
             invalidate()
         }
 
@@ -808,7 +948,7 @@ class WeekView @JvmOverloads constructor(
      */
 
     @PublicApi
-    var isShowHourSeparators: Boolean
+    var showHourSeparators: Boolean
         get() = viewState.showHourSeparators
         set(value) {
             viewState.showHourSeparators = value
@@ -824,10 +964,10 @@ class WeekView @JvmOverloads constructor(
         }
 
     @PublicApi
-    var hourSeparatorStrokeWidth: Float
-        get() = viewState.hourSeparatorPaint.strokeWidth
+    var hourSeparatorStrokeWidth: Int
+        get() = viewState.hourSeparatorPaint.strokeWidth.roundToInt()
         set(value) {
-            viewState.hourSeparatorPaint.strokeWidth = value
+            viewState.hourSeparatorPaint.strokeWidth = value.toFloat()
             invalidate()
         }
 
@@ -843,7 +983,7 @@ class WeekView @JvmOverloads constructor(
      * Returns whether vertical lines are displayed as separators between dates.
      */
     @PublicApi
-    var isShowDaySeparators: Boolean
+    var showDaySeparators: Boolean
         get() = viewState.showDaySeparators
         set(value) {
             viewState.showDaySeparators = value
@@ -865,10 +1005,10 @@ class WeekView @JvmOverloads constructor(
      * Returns the stroke color of the separators between dates.
      */
     @PublicApi
-    var daySeparatorStrokeWidth: Float
-        get() = viewState.daySeparatorPaint.strokeWidth
+    var daySeparatorStrokeWidth: Int
+        get() = viewState.daySeparatorPaint.strokeWidth.roundToInt()
         set(value) {
-            viewState.daySeparatorPaint.strokeWidth = value
+            viewState.daySeparatorPaint.strokeWidth = value.toFloat()
             invalidate()
         }
 
@@ -893,7 +1033,7 @@ class WeekView @JvmOverloads constructor(
                 throw IllegalArgumentException("Can't set a minDate that's after maxDate")
             }
 
-            viewState.minDate = value
+            viewState.minDate = value?.copy()
             invalidate()
         }
 
@@ -910,7 +1050,7 @@ class WeekView @JvmOverloads constructor(
                 throw IllegalArgumentException("Can't set a maxDate that's before minDate")
             }
 
-            viewState.maxDate = value
+            viewState.maxDate = value?.copy()
             invalidate()
         }
 
@@ -1032,50 +1172,130 @@ class WeekView @JvmOverloads constructor(
      */
     @PublicApi
     val firstVisibleDate: Calendar
-        get() = viewState.firstVisibleDate.copy()
+        get() = viewState.dateRange.first().copy()
 
     /**
      * Returns the last visible date.
      */
     @PublicApi
     val lastVisibleDate: Calendar
-        get() = viewState.firstVisibleDate.copy() + Days(viewState.numberOfVisibleDays - 1)
+        get() = viewState.dateRange.last().copy()
 
     /**
-     * Shows the current date.
+     * Scrolls to the specified date. Any provided [Calendar] that falls outside the range of
+     * [minDate] and [maxDate] will be adjusted to fit into this range.
+     *
+     * @param date A [Calendar] representing the date to scroll to.
      */
     @PublicApi
-    fun goToToday() {
-        goToDate(today())
+    fun scrollToDate(date: Calendar) {
+        internalScrollToDate(date.withLocalTimeZone())
     }
 
     /**
-     * Shows the current date and time.
+     * Scrolls to the specified date time. Any provided [Calendar] that falls outside the range of
+     * [minDate] and [maxDate], or [minHour] and [maxHour], will be adjusted to fit into these
+     * ranges.
+     *
+     * @param dateTime A [Calendar] representing the date time to scroll to.
      */
     @PublicApi
-    fun goToCurrentTime() {
-        now().apply {
-            goToDate(this)
-            goToHour(hour)
+    fun scrollToDateTime(dateTime: Calendar) {
+        val localeDate = dateTime.withLocalTimeZone()
+        internalScrollToDate(localeDate) {
+            scrollToTime(hour = it.hour, minute = it.minute)
         }
     }
 
     /**
-     * Shows a specific date. If it is before [minDate] or after [maxDate], these will be shown
-     * instead.
+     * Scrolls to the specified time. Any provided time that falls outside the range of [minHour]
+     * and [maxHour] will be adjusted to fit into these ranges.
+     *
+     * @param hour The hour to scroll to.
+     * @param minute The minute to scroll to.
+     */
+    @PublicApi
+    fun scrollToTime(hour: Int, minute: Int) {
+        if (isWaitingToBeLaidOut) {
+            // If the view's dimensions have just changed or if it hasn't been laid out yet, we
+            // postpone the action until onDraw() is called the next time.
+            viewState.scrollToHour = hour
+            return
+        }
+
+        val sanitizedHour = hour.coerceIn(minimumValue = minHour, maximumValue = maxHour)
+        val desired = now().withTime(hour = sanitizedHour, minutes = 0)
+
+        if (desired.hour > minHour) {
+            // Add some padding above the current time (and thus: the now line)
+            desired -= Hours(1)
+        } else {
+            desired -= Minutes(desired.minute)
+        }
+
+        val fraction = desired.minute / 60f
+        val verticalOffset = hourHeight * (desired.hour + fraction)
+
+        // We make sure that WeekView doesn't "over-scroll" by limiting the offset to the total day
+        // height minus the height of WeekView, which would result in scrolling all the way to the
+        // bottom.
+        val maxOffset = viewState.dayHeight - height
+        val finalOffset = min(maxOffset, verticalOffset) * (-1)
+
+        navigator.scrollVerticallyTo(offset = finalOffset)
+    }
+
+    /**
+     * Scrolls to the current date.
+     */
+    @Deprecated(
+        message = "This method will be removed in a future release. Use scrollToDate() instead.",
+        replaceWith = ReplaceWith(expression = "scrollToDate")
+    )
+    @PublicApi
+    fun goToToday() {
+        scrollToDate(today())
+    }
+
+    /**
+     * Scrolls to the current date and time.
+     */
+    @Deprecated(
+        message = "This method will be removed in a future release. Use scrollToDateTime() instead.",
+        replaceWith = ReplaceWith(expression = "scrollToDateTime")
+    )
+    @PublicApi
+    fun goToCurrentTime() {
+        internalScrollToDate(
+            date = now(),
+            onComplete = { scrollToTime(hour = it.hour, minute = it.minute) }
+        )
+    }
+
+    /**
+     * Scrolls to a specific date. If the date is before [minDate] or after [maxDate], [WeekView]
+     * will scroll to them instead.
      *
      * @param date The date to show.
      */
+    @Deprecated(
+        message = "This method will be removed in a future release. Use scrollToDate() instead.",
+        replaceWith = ReplaceWith(expression = "scrollToDate")
+    )
     @PublicApi
     fun goToDate(date: Calendar) {
-        val adjustedDate = viewState.getDateWithinDateRange(date)
+        scrollToDate(date)
+    }
+
+    private fun internalScrollToDate(date: Calendar, onComplete: (Calendar) -> Unit = {}) {
+        val adjustedDate = viewState.getStartDateInAllowedRange(date)
         if (adjustedDate.toEpochDays() == viewState.firstVisibleDate.toEpochDays()) {
+            onComplete(adjustedDate)
             return
         }
 
         gestureHandler.forceScrollFinished()
 
-        val isWaitingToBeLaidOut = ViewCompat.isLaidOut(this).not()
         if (isWaitingToBeLaidOut) {
             // If the view's dimensions have just changed or if it hasn't been laid out yet, we
             // postpone the action until onDraw() is called the next time.
@@ -1083,77 +1303,37 @@ class WeekView @JvmOverloads constructor(
             return
         }
 
-        val destinationOffset = viewState.getXOriginForDate(date)
-        val adjustedDestinationOffset = destinationOffset.limit(
-            minValue = viewState.minX,
-            maxValue = viewState.maxX
-        )
-
-        scroller.animate(
-            fromValue = viewState.currentOrigin.x,
-            toValue = adjustedDestinationOffset,
-            onUpdate = {
-                viewState.currentOrigin.x = it
-                invalidate()
-            },
-            onEnd = {
-                val lastVisibleDate = adjustedDate + Days(numberOfVisibleDays - 1)
-                adapter?.onRangeChanged(
-                    firstVisibleDate = adjustedDate,
-                    lastVisibleDate = lastVisibleDate
-                )
-            }
-        )
+        navigator.scrollHorizontallyTo(date = date, onFinished = { onComplete(adjustedDate) })
     }
 
     /**
-     * Scrolls to a specific hour.
+     * Scrolls to a specific hour. If the hour is before [minHour] or after [maxHour], [WeekView]
+     * will scroll to them instead.
      *
      * @param hour The hour to scroll to, in 24-hour format. Supported values are 0-24.
-     *
-     * @throws IllegalArgumentException Throws exception if the provided hour is smaller than
-     *                                   [minHour] or larger than [maxHour].
      */
+    @Deprecated(
+        message = "This method will be removed in a future release. Use scrollToTime() instead.",
+        replaceWith = ReplaceWith(expression = "scrollToTime")
+    )
     @PublicApi
     fun goToHour(hour: Int) {
-        val isWaitingToBeLaidOut = ViewCompat.isLaidOut(this).not()
-        if (isWaitingToBeLaidOut) {
-            viewState.scrollToHour = hour
-            return
-        }
-
-        if (hour !in viewState.minHour..viewState.maxHour) {
-            throw IllegalArgumentException(
-                "The provided hour ($hour) is outside of the set time range " +
-                    "(${viewState.minHour} – ${viewState.maxHour})"
-            )
-        }
-
-        val hourHeight = viewState.hourHeight
-        val desiredOffset = hourHeight * (hour - viewState.minHour)
-
-        // We make sure that WeekView doesn't "over-scroll" by limiting the offset to the total day
-        // height minus the height of WeekView, which would result in scrolling all the way to the
-        // bottom.
-        val maxOffset = viewState.dayHeight - height
-        val finalOffset = min(maxOffset, desiredOffset) * (-1)
-
-        scroller.animate(
-            fromValue = viewState.currentOrigin.y,
-            toValue = finalOffset,
-            onUpdate = {
-                viewState.currentOrigin.y = it
-                invalidate()
-            }
-        )
+        scrollToTime(hour = hour, minute = 0)
     }
 
     /**
      * Returns the first hour that is visible on the screen.
      */
     @PublicApi
-    val firstVisibleHour: Double
-        get() = (viewState.currentOrigin.y * -1 / viewState.hourHeight).toDouble()
+    val firstVisibleHour: Int
+        get() = viewState.minHour + (viewState.currentOrigin.y * -1 / viewState.hourHeight).toInt()
+
+    /**
+     * Returns the first hour that is fully visible on the screen.
+     */
+    @PublicApi
+    val firstFullyVisibleHour: Int
+        get() = viewState.minHour + ceil(viewState.currentOrigin.y * -1 / viewState.hourHeight).toInt()
 
     /*
      ***********************************************************************************************
@@ -1191,17 +1371,10 @@ class WeekView @JvmOverloads constructor(
         }
 
     private fun setAdapterInternal(adapter: Adapter<*>?) {
-        if (adapter == null) {
-            internalAdapter?.unregisterObserver()
-            touchHandler.adapter = null
-            return
-        }
-
-        adapter.eventChipsCache = eventChipsCache
         internalAdapter = adapter
         touchHandler.adapter = adapter
-
-        internalAdapter?.registerObserver(this)
+        adapter?.registerObserver(this)
+        invalidate()
     }
 
     @PublicApi
@@ -1252,14 +1425,12 @@ class WeekView @JvmOverloads constructor(
      */
     abstract class Adapter<T> {
 
-        internal abstract val eventsCache: EventsCache<T>
+        internal abstract val eventsCache: EventsCache
+        internal val eventChipsCache: EventChipsCache by lazy { EventChipsCache() }
+        private val eventChipsFactory: EventChipsFactory by lazy { EventChipsFactory() }
 
-        private val eventChipsFactory = EventChipsFactory()
-
-        internal lateinit var eventChipsCache: EventChipsCache
-
-        internal val eventsDiffer: EventsDiffer<T> by lazy {
-            EventsDiffer(
+        internal val eventsProcessor: EventsProcessor by lazy {
+            EventsProcessor(
                 context = context,
                 eventsCache = eventsCache,
                 eventChipsCache = eventChipsCache,
@@ -1270,6 +1441,9 @@ class WeekView @JvmOverloads constructor(
         internal var weekView: WeekView? = null
             private set
 
+        /**
+         * Provides the [Context] that the adapter's [WeekView] is running in.
+         */
         val context: Context
             get() = checkNotNull(weekView).context
 
@@ -1283,10 +1457,6 @@ class WeekView @JvmOverloads constructor(
             return true
         }
 
-        internal fun handleEmptyViewClick(time: Calendar) {
-            onEmptyViewClick(time)
-        }
-
         internal fun handleLongClick(x: Float, y: Float): Boolean {
             val eventChip = findHitEvent(x, y) ?: return false
             val data = findEventData(id = eventChip.originalEvent.id) ?: return false
@@ -1297,18 +1467,14 @@ class WeekView @JvmOverloads constructor(
             return true
         }
 
-        internal fun handleEmptyViewLongClick(time: Calendar) {
-            onEmptyViewLongClick(time)
-        }
-
         private fun findHitEvent(x: Float, y: Float): EventChip? {
             val candidates = eventChipsCache.allEventChips.filter { it.isHit(x, y) }
             return when {
                 candidates.isEmpty() -> null
                 // Two events hit. This is most likely because an all-day event was clicked, but a
                 // single event is rendered underneath it. We return the all-day event.
-                candidates.size == 2 -> candidates.first { it.event.isAllDay }
-                else -> candidates.first()
+                candidates.size == 2 -> candidates.first { it.event.isAllDay }.takeUnless { it.isHidden }
+                else -> candidates.first().takeUnless { it.isHidden }
             }
         }
 
@@ -1320,50 +1486,65 @@ class WeekView @JvmOverloads constructor(
             weekView?.invalidate()
         }
 
-        internal fun unregisterObserver() {
-            weekView = null
+        internal fun onEventClick(id: Long, bounds: RectF) {
+            val data = findEventData(id) ?: return
+            onEventClick(data)
+            onEventClick(data, bounds)
         }
 
-        internal fun onEventClick(id: Long) {
-            val event = eventsCache[id] ?: return
-            onEventClick(data = event.data)
+        internal fun onEventLongClick(id: Long, bounds: RectF) {
+            val data = findEventData(id) ?: return
+            onEventLongClick(data)
+            onEventLongClick(data, bounds)
         }
 
-        internal fun onEventLongClick(id: Long) {
-            val event = eventsCache[id] ?: return
-            onEventLongClick(data = event.data)
+        @Suppress("UNCHECKED_CAST")
+        private fun findEventData(id: Long): T? {
+            val match = eventsCache[id]
+            return (match as? ResolvedWeekViewEntity.Event<T>)?.data
         }
-
-        private fun findEventData(id: Long): T? = eventsCache[id]?.data
 
         /**
-         * Returns the data of the [WeekViewEvent] that the user clicked on.
+         * Called for each element of type [T] that was submitted to this adapter. This method must
+         * return a [WeekViewEntity] that will be rendered in the [WeekView] that is associated with
+         * this adapter.
          *
-         * @param data The data of the [WeekViewEvent]
+         * @param item The item of type [T] that was submitted to [WeekView]
+         * @return A [WeekViewEntity] that will be rendered in [WeekView]
+         */
+        open fun onCreateEntity(item: T): WeekViewEntity {
+            throw RuntimeException("You called submitList() on WeekView's adapter, but didn't implement onCreateEntity(). " +
+                "Please do so to convert the submitted elements to WeekViewEntity objects.")
+        }
+
+        /**
+         * Returns the data of the [WeekViewEntity.Event] that the user clicked on.
+         *
+         * @param data The data of the [WeekViewEntity.Event]
          */
         open fun onEventClick(data: T) = Unit
 
         /**
-         * Returns the data of the [WeekViewEvent] that the user clicked on as well as the bounds
-         * of the [EventChip] in which it is displayed.
+         * Returns the data of the [WeekViewEntity.Event] that the user clicked on as well as the
+         * bounds of the [EventChip] in which it is displayed.
          *
-         * @param data The data of the [WeekViewEvent]
+         * @param data The data of the [WeekViewEntity.Event]
          * @param bounds The [RectF] representing the bounds of the event's [EventChip]
          */
         open fun onEventClick(data: T, bounds: RectF) = Unit
 
         /**
-         * Returns the data of the [WeekViewEvent] that the user long-clicked on.
+         * Returns the data of the [WeekViewEntity.Event] that the user long-clicked on.
          *
-         * @param data The data of the [WeekViewEvent]
+         * @param data The data of the [WeekViewEntity.Event]
          */
         open fun onEventLongClick(data: T) = Unit
 
         /**
-         * Returns the data of the [WeekViewEvent] that the user long-clicked on as well as the
-         * bounds of the [EventChip] in which it is displayed.
+         * Returns the data of the [WeekViewEntity.Event] that the user long-clicked on as well as
+         * the bounds of the [EventChip] in which it is displayed.
          *
-         * @param data The data of the [WeekViewEvent]
+         * @param data The data of the [WeekViewEntity.Event]
          * @param bounds The [RectF] representing the bounds of the event's [EventChip]
          */
         open fun onEventLongClick(data: T, bounds: RectF) = Unit
@@ -1397,15 +1578,15 @@ class WeekView @JvmOverloads constructor(
      * An implementation of [WeekView.Adapter] that allows to submit a list of new elements to
      * [WeekView].
      *
-     * Newly submitted events are processed on a background thread and then presented in
-     * [WeekView]. Previously submitted events are replaced completely. If you require a paginated
-     * approach, you might want to use [WeekView.PagingAdapter].
+     * Newly submitted events are processed on a background thread and then presented in [WeekView].
+     * Previously submitted events are replaced completely. If you require a paginated approach, you
+     * might want to use [WeekView.PagingAdapter].
      *
      * @param T The type of elements that are displayed in the corresponding [WeekView].
      */
-    open class SimpleAdapter<T> : Adapter<T>() {
+    abstract class SimpleAdapter<T> : Adapter<T>() {
 
-        override val eventsCache = SimpleEventsCache<T>()
+        override val eventsCache = SimpleEventsCache()
 
         /**
          * Submits a new list of [WeekViewDisplayable] elements to the adapter. These events are
@@ -1415,9 +1596,28 @@ class WeekView @JvmOverloads constructor(
          * @param events The [WeekViewDisplayable] elements that are to be displayed in [WeekView]
          */
         @PublicApi
+        @Deprecated(
+            message = "Use submitList() to submit a list of elements of type T instead. Then, overwrite the adapter's onCreateEntity() method to create a WeekViewEntity.",
+            replaceWith = ReplaceWith(expression = "submitList")
+        )
         fun submit(events: List<WeekViewDisplayable<T>>) {
             val viewState = weekView?.viewState ?: return
-            eventsDiffer.submit(events, viewState, onFinished = this::updateObserver)
+            val entities = events.map { it.toWeekViewEntity(context) }
+            eventsProcessor.submit(entities, viewState, onFinished = this::updateObserver)
+        }
+
+        /**
+         * Submits a new list of elements to the adapter. These events are processed on a background
+         * thread and then presented in [WeekView]. Previously submitted events are replaced
+         * completely.
+         *
+         * @param elements The elements of type [T] that are to be displayed in [WeekView]
+         */
+        @PublicApi
+        fun submitList(elements: List<T>) {
+            val viewState = weekView?.viewState ?: return
+            val entities = elements.map(this::onCreateEntity)
+            eventsProcessor.submit(entities, viewState, onFinished = this::updateObserver)
         }
     }
 
@@ -1425,40 +1625,57 @@ class WeekView @JvmOverloads constructor(
      * An implementation of [WeekView.Adapter] that allows to submit a list of new elements to
      * [WeekView] in a paginated way.
      *
-     * This adapter keeps a cache of [WeekViewDisplayable] elements grouped by month. Whenever the
-     * user scrolls to a different month, this adapter will check whether that month's events are
-     * present in the cache. If not, it will dispatch a callback to [onLoadMore] with the start and
-     * end dates of the months that need to be fetched.
+     * This adapter keeps a cache of the submitted elements grouped by month. Whenever the user
+     * scrolls to a different month, this adapter will check whether that month's events are present
+     * in the cache. If not, it will dispatch a callback to [onLoadMore] with the start and end
+     * dates of the months that need to be fetched.
      *
-     * Newly submitted events are processed on a background thread and then presented in
-     * [WeekView]. To clear the cache and thus refresh all events, you can call [refresh].
+     * Newly submitted events are processed on a background thread and then presented in [WeekView].
+     * To clear the cache and thus refresh all events, you can call [refresh].
      *
      * @param T The type of elements that are displayed in the corresponding [WeekView].
      */
-    open class PagingAdapter<T> : Adapter<T>() {
+    abstract class PagingAdapter<T> : Adapter<T>() {
 
-        override val eventsCache = PagedEventsCache<T>()
+        override val eventsCache = PaginatedEventsCache()
 
         /**
          * Submits a new list of [WeekViewDisplayable] elements to the adapter. These events are
-         * processed on a background thread and then presented in [WeekView]. Previously submitted
-         * events of the same month are replaced completely.
+         * processed on a background thread and then presented in [WeekView].
          *
          * @param events The [WeekViewDisplayable] elements that are to be displayed in [WeekView]
          */
         @PublicApi
+        @Deprecated(
+            message = "Use submitList() to submit a list of elements of type T instead. Then, overwrite the adapter's onCreateEntity() method to create a WeekViewEntity.",
+            replaceWith = ReplaceWith(expression = "submitList")
+        )
         fun submit(events: List<WeekViewDisplayable<T>>) {
             val viewState = weekView?.viewState ?: return
-            eventsDiffer.submit(events, viewState, onFinished = this::updateObserver)
+            val entities = events.map { it.toWeekViewEntity(context) }
+            eventsProcessor.submit(entities, viewState, onFinished = this::updateObserver)
         }
 
         /**
-         * Called whenever [WeekView] needs to fetch [WeekViewDisplayable] elements of a given
-         * month in order to allow for a smooth scrolling experience.
+         * Submits a new list of elements of type [T] to the adapter. These events are processed on
+         * a background thread and then presented in [WeekView].
          *
-         * This adapter caches [WeekViewDisplayable] elements of the current month as well as its
-         * previous and next month. If [WeekView] scrolls to a new month, that month as well as its
-         * surrounding months need to potentially be fetched.
+         * @param elements The elements of type [T] that are to be displayed in [WeekView]
+         */
+        @PublicApi
+        fun submitList(elements: List<T>) {
+            val viewState = weekView?.viewState ?: return
+            val entities = elements.map(this::onCreateEntity)
+            eventsProcessor.submit(entities, viewState, onFinished = this::updateObserver)
+        }
+
+        /**
+         * Called whenever [WeekView] needs to fetch new elements of a given month in order to allow
+         * for a smooth scrolling experience.
+         *
+         * This adapter caches submitted elements of the current month as well as its previous and
+         * next month. If [WeekView] scrolls to a new month, that month as well as its surrounding
+         * months need to potentially be fetched.
          *
          * @param startDate A [Calendar] of the first date of the month that needs to be fetched
          * @param endDate A [Calendar] of the last date of the month that needs to be fetched
@@ -1467,16 +1684,17 @@ class WeekView @JvmOverloads constructor(
         open fun onLoadMore(startDate: Calendar, endDate: Calendar) = Unit
 
         /**
-         * Refreshes the [WeekViewDisplayable] elements presented by this adapter. All cached
-         * elements will be removed and a call to [onLoadMore] will be triggered.
+         * Refreshes the elements presented by this adapter. All cached elements will be removed and
+         * a call to [onLoadMore] will be triggered.
          */
         @PublicApi
         fun refresh() {
             eventsCache.clear()
+            eventChipsCache.clear()
             weekView?.invalidate()
         }
 
-        internal fun loadPeriodsIfNecessary() {
+        internal fun dispatchLoadRequest() {
             val firstVisibleDate = weekView?.viewState?.firstVisibleDate ?: return
             val fetchRange = FetchRange.create(firstVisibleDate)
             if (fetchRange in eventsCache) {

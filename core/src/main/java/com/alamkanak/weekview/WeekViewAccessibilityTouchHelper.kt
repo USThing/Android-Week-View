@@ -16,7 +16,7 @@ internal class WeekViewAccessibilityTouchHelper(
     private val view: WeekView,
     private val viewState: ViewState,
     private val touchHandler: WeekViewTouchHandler,
-    private val eventChipsCache: EventChipsCache
+    private val eventChipsCacheProvider: EventChipsCacheProvider
 ) : ExploreByTouchHelper(view) {
 
     private val dateFormatter = SimpleDateFormat.getDateInstance(LONG)
@@ -26,7 +26,7 @@ internal class WeekViewAccessibilityTouchHelper(
 
     override fun getVirtualViewAt(x: Float, y: Float): Int {
         // First, we check if an event chip was hit
-        val eventChip = eventChipsCache.findHitEvent(x, y)
+        val eventChip = eventChipsCacheProvider()?.findHitEvent(x, y)
         val eventChipVirtualViewId = eventChip?.let { store[it] }
         if (eventChipVirtualViewId != null) {
             return eventChipVirtualViewId
@@ -45,7 +45,7 @@ internal class WeekViewAccessibilityTouchHelper(
 
     override fun getVisibleVirtualViews(virtualViewIds: MutableList<Int>) {
         val dateRange = viewState.dateRange
-        val visibleEventChips = eventChipsCache.allEventChipsInDateRange(dateRange)
+        val visibleEventChips = eventChipsCacheProvider()?.allEventChipsInDateRange(dateRange).orEmpty()
         virtualViewIds += store.put(visibleEventChips)
         virtualViewIds += dateRange.map { store.put(it) }
     }
@@ -71,12 +71,18 @@ internal class WeekViewAccessibilityTouchHelper(
         action: Int
     ): Boolean = when (action) {
         AccessibilityNodeInfoCompat.ACTION_CLICK -> {
-            touchHandler.adapter?.onEventClick(id = eventChip.originalEvent.id)
+            touchHandler.adapter?.onEventClick(
+                id = eventChip.originalEvent.id,
+                bounds = eventChip.bounds
+            )
             sendEventForVirtualView(virtualViewId, AccessibilityEvent.TYPE_VIEW_CLICKED)
             true
         }
         AccessibilityNodeInfoCompat.ACTION_LONG_CLICK -> {
-            touchHandler.adapter?.onEventLongClick(id = eventChip.originalEvent.id)
+            touchHandler.adapter?.onEventLongClick(
+                id = eventChip.originalEvent.id,
+                bounds = eventChip.bounds
+            )
             sendEventForVirtualView(virtualViewId, AccessibilityEvent.TYPE_VIEW_LONG_CLICKED)
             true
         }
@@ -129,7 +135,7 @@ internal class WeekViewAccessibilityTouchHelper(
         node.addAction(AccessibilityActionCompat.ACTION_LONG_CLICK)
 
         val bounds = Rect()
-        eventChip.bounds?.round(bounds)
+        eventChip.bounds.round(bounds)
         node.setBoundsInParent(bounds)
     }
 
@@ -154,9 +160,9 @@ internal class WeekViewAccessibilityTouchHelper(
         node.setBoundsInParent(bounds)
     }
 
-    private fun createDescriptionForVirtualView(event: ResolvedWeekViewEvent<*>): String {
+    private fun createDescriptionForVirtualView(event: ResolvedWeekViewEntity): String {
         val date = dateTimeFormatter.format(event.startTime.time)
-        return "$date: ${event.title}, ${event.location}"
+        return "$date: ${event.title}, ${event.subtitle}"
     }
 
     private fun createDescriptionForVirtualView(date: Calendar): String {

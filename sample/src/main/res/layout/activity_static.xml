@@ -6,7 +6,9 @@
     android:layout_height="match_parent"
     android:orientation="vertical">
 
-    <include layout="@layout/view_toolbar" />
+    <include
+        android:id="@+id/toolbarContainer"
+        layout="@layout/view_toolbar" />
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -14,7 +16,7 @@
         android:orientation="horizontal">
 
         <ImageView
-            android:id="@+id/previousWeekButton"
+            android:id="@+id/leftNavigationButton"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
@@ -35,7 +37,7 @@
             tools:text="01/01/2018" />
 
         <ImageView
-            android:id="@+id/nextWeekButton"
+            android:id="@+id/rightNavigationButton"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
@@ -52,10 +54,10 @@
         app:columnGap="1dp"
         app:eventCornerRadius="4dp"
         app:eventTextColor="@color/white"
-        app:headerRowBottomLineColor="@color/gray_300"
-        app:headerRowBottomLineWidth="1dp"
-        app:headerRowPadding="12dp"
-        app:headerRowTextColor="@color/gray_600"
+        app:headerBottomLineColor="@color/gray_300"
+        app:headerBottomLineWidth="1dp"
+        app:headerPadding="12dp"
+        app:headerTextColor="@color/gray_600"
         app:horizontalScrollingEnabled="false"
         app:hourHeight="60dp"
         app:nowLineColor="@color/accent"
@@ -65,11 +67,11 @@
         app:numberOfVisibleDays="7"
         app:overlappingEventGap="1dp"
         app:showFirstDayOfWeekFirst="true"
-        app:showHeaderRowBottomLine="true"
+        app:showHeaderBottomLine="true"
         app:showNowLine="true"
         app:showNowLineDot="true"
         app:showTimeColumnSeparator="true"
-        app:singleDayHorizontalMargin="8dp"
+        app:singleDayHorizontalPadding="8dp"
         app:timeColumnBackgroundColor="@color/white"
         app:timeColumnPadding="8dp"
         app:timeColumnSeparatorColor="@color/gray_300"

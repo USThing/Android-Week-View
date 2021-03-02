@@ -1,39 +1,29 @@
 group = 'com.github.thellmund.Android-Week-View'
-version = '5.0.0'
+version = '5.2.2'
 
 apply plugin: 'com.github.dcendents.android-maven'
 apply plugin: 'com.android.library'
 apply plugin: 'kotlin-android'
-apply plugin: 'kotlin-android-extensions'
 
 android {
     compileSdkVersion buildConfig.compileSdk
     defaultConfig {
         minSdkVersion buildConfig.minSdk
         targetSdkVersion buildConfig.targetSdk
-
-        // Required for core library desugaring
-        multiDexEnabled true
     }
     compileOptions {
-        coreLibraryDesugaringEnabled true
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
     }
     testOptions {
         unitTests.includeAndroidResources = true
     }
-    androidExtensions {
-        experimental = true
-    }
 }
 
 dependencies {
+    implementation project(':base')
     implementation libraries.kotlin
     implementation libraries.appCompat
-    implementation libraries.emoji
-
-    coreLibraryDesugaring libraries.coreLibraryDesugaring
 
     testImplementation testing.androidxjUnit
     testImplementation testing.androidxTestRunner

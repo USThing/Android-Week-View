@@ -10,15 +10,28 @@ internal class EventChipBoundsCalculator(
         eventChip: EventChip,
         startPixel: Float
     ): RectF {
-        val drawableWidth = viewState.drawableDayWidth
+        val drawableWidth = when (eventChip.event) {
+            is ResolvedWeekViewEntity.Event<*> -> viewState.drawableDayWidth
+            is ResolvedWeekViewEntity.BlockedTime -> viewState.dayWidth
+        }
+
+        val isFullWidth = eventChip.originalEvent is ResolvedWeekViewEntity.BlockedTime
+        val leftOffset = if (viewState.isLtr || isFullWidth) 0 else viewState.columnGap
 
         val minutesFromStart = eventChip.minutesFromStartHour
         val top = calculateDistanceFromTop(minutesFromStart)
 
         val bottomMinutesFromStart = minutesFromStart + eventChip.event.durationInMinutes
-        val bottom = calculateDistanceFromTop(bottomMinutesFromStart) - viewState.eventMarginVertical
+        var bottom = calculateDistanceFromTop(bottomMinutesFromStart)
+        val isEvent = eventChip.event is ResolvedWeekViewEntity.Event<*>
 
-        var left = startPixel + eventChip.relativeStart * drawableWidth
+        if (isEvent && bottom != viewState.calendarGridBounds.bottom) {
+            // Add the vertical event margin only if the event is not at the end of the day;
+            // otherwise, the event chip would be cut off a few pixels early
+            bottom -= viewState.eventMarginVertical
+        }
+
+        var left = startPixel + leftOffset + eventChip.relativeStart * drawableWidth
         var right = left + eventChip.relativeWidth * drawableWidth
 
         if (left > startPixel) {
@@ -31,7 +44,7 @@ internal class EventChipBoundsCalculator(
 
         val hasNoOverlaps = (right == startPixel + drawableWidth)
         if (viewState.isSingleDay && hasNoOverlaps) {
-            right -= viewState.eventMarginHorizontal * 2
+            right -= viewState.singleDayHorizontalPadding * 2
         }
 
         return RectF(left, top, right, bottom)
@@ -46,31 +59,51 @@ internal class EventChipBoundsCalculator(
     }
 
     fun calculateAllDayEvent(
+        index: Int,
         eventChip: EventChip,
         startPixel: Float
     ): RectF {
-        val padding = viewState.headerRowPadding
+        val padding = viewState.headerPadding
+        val dayWidth = viewState.drawableDayWidth
+        val leftTextOffset = if (viewState.isLtr) 0 else viewState.columnGap
 
-        val top = padding + viewState.dateLabelHeight + padding
-        val height = viewState.allDayEventTextPaint.textSize + viewState.eventPaddingVertical * 2
-        val bottom = top + height
+        val dateLabelHeight = padding + viewState.dateLabelHeight + padding
+        val chipHeight = viewState.allDayEventTextPaint.textSize + viewState.eventPaddingVertical * 2
 
-        val chipWidth = viewState.drawableDayWidth
+        val top = if (viewState.arrangeAllDayEventsVertically) {
+            val previousChipsHeight = index * (eventChip.bounds.height() + viewState.eventMarginVertical)
+            dateLabelHeight + previousChipsHeight
+        } else {
+            dateLabelHeight
+        }
 
-        var left = startPixel + eventChip.relativeStart * chipWidth
-        var right = left + eventChip.relativeWidth * chipWidth
+        var left = if (viewState.arrangeAllDayEventsVertically) {
+            startPixel + leftTextOffset
+        } else {
+            startPixel + leftTextOffset + eventChip.relativeStart * dayWidth
+        }
 
-        if (left > startPixel) {
+        var right = if (viewState.arrangeAllDayEventsVertically) {
+            left + dayWidth
+        } else {
+            left + eventChip.relativeWidth * dayWidth
+        }
+
+        val isLeftMostColumn = left == startPixel
+        val isRightMostColumn = right == startPixel + dayWidth
+
+        if (!isLeftMostColumn) {
             left += viewState.overlappingEventGap / 2f
         }
 
-        if (right < startPixel + chipWidth) {
+        if (!isRightMostColumn) {
             right -= viewState.overlappingEventGap / 2f
         }
 
-        val hasNoOverlaps = (right == startPixel + chipWidth)
-        if (viewState.isSingleDay && hasNoOverlaps) {
-            right -= viewState.eventMarginHorizontal * 2
+        val bottom = top + chipHeight
+
+        if (viewState.isSingleDay && isRightMostColumn) {
+            right -= viewState.singleDayHorizontalPadding * 2
         }
 
         return RectF(left, top, right, bottom)

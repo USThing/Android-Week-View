@@ -12,31 +12,45 @@ internal class EventChipDrawer(
     private val backgroundPaint = Paint()
     private val borderPaint = Paint()
 
+    private val patternPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+
     internal fun draw(
         eventChip: EventChip,
         canvas: Canvas,
-        textLayout: StaticLayout
+        textLayout: StaticLayout?
     ) {
         canvas.drawInBounds(eventChip.bounds) {
             val event = eventChip.event
-
-            val cornerRadius = viewState.eventCornerRadius.toFloat()
-            updateBackgroundPaint(event, backgroundPaint)
-
             val bounds = eventChip.bounds
+            val cornerRadius = event.style.cornerRadius?.toFloat() ?: viewState.eventCornerRadius.toFloat()
+            updateBackgroundPaint(event, backgroundPaint)
             drawRoundRect(bounds, cornerRadius, cornerRadius, backgroundPaint)
 
-            if (event.style.borderWidth != null) {
+            val pattern = event.style.pattern
+            if (pattern != null) {
+                drawPattern(
+                    pattern = pattern,
+                    bounds = eventChip.bounds,
+                    isLtr = viewState.isLtr,
+                    paint = patternPaint
+                )
+            }
+
+            val borderWidth = event.style.borderWidth
+            if (borderWidth != null && borderWidth > 0) {
                 updateBorderPaint(event, borderPaint)
-                val borderBounds = bounds.insetBy(event.style.borderWidth / 2f)
+                val borderBounds = bounds.insetBy(borderWidth / 2f)
                 drawRoundRect(borderBounds, cornerRadius, cornerRadius, borderPaint)
             }
 
-            if (event.isNotAllDay) {
+            val originalEvent = eventChip.originalEvent
+            if (originalEvent.isMultiDay && originalEvent.isNotAllDay) {
                 drawCornersForMultiDayEvents(eventChip, cornerRadius)
             }
 
-            drawEventTitle(eventChip, textLayout)
+            if (textLayout != null) {
+                drawEventTitle(eventChip, textLayout)
+            }
         }
     }
 
@@ -119,7 +133,12 @@ internal class EventChipDrawer(
         textLayout: StaticLayout
     ) {
         val bounds = eventChip.bounds
-        val horizontalOffset = bounds.left + viewState.eventPaddingHorizontal
+
+        val horizontalOffset = if (viewState.isLtr) {
+            bounds.left + viewState.eventPaddingHorizontal
+        } else {
+            bounds.right - viewState.eventPaddingHorizontal
+        }
 
         val verticalOffset = if (eventChip.event.isAllDay) {
             (bounds.height() - textLayout.height) / 2f
@@ -133,7 +152,7 @@ internal class EventChipDrawer(
     }
 
     private fun updateBackgroundPaint(
-        event: ResolvedWeekViewEvent<*>,
+        event: ResolvedWeekViewEntity,
         paint: Paint
     ) = with(paint) {
         color = event.style.backgroundColor ?: viewState.defaultEventColor
@@ -143,7 +162,7 @@ internal class EventChipDrawer(
     }
 
     private fun updateBorderPaint(
-        event: ResolvedWeekViewEvent<*>,
+        event: ResolvedWeekViewEntity,
         paint: Paint
     ) = with(paint) {
         color = event.style.borderColor ?: viewState.defaultEventColor

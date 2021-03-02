@@ -7,28 +7,27 @@ import android.text.StaticLayout
 import androidx.collection.ArrayMap
 import java.util.Calendar
 import kotlin.math.max
+import kotlin.math.min
 
 internal class CalendarRenderer(
     viewState: ViewState,
-    eventChipsCache: EventChipsCache
+    eventChipsCacheProvider: EventChipsCacheProvider
 ) : Renderer {
 
     private val singleEventLabels = ArrayMap<String, StaticLayout>()
-    private val eventsUpdater = SingleEventsUpdater(viewState, eventChipsCache, singleEventLabels)
+    private val eventsUpdater = SingleEventsUpdater(viewState, eventChipsCacheProvider, singleEventLabels)
 
     // Be careful when changing the order of the drawers, as that might cause
     // views to incorrectly draw over each other
     private val drawers = listOf(
         DayBackgroundDrawer(viewState),
         BackgroundGridDrawer(viewState),
-        SingleEventsDrawer(viewState, eventChipsCache, singleEventLabels),
+        SingleEventsDrawer(viewState, eventChipsCacheProvider, singleEventLabels),
         NowLineDrawer(viewState)
     )
 
     override fun render(canvas: Canvas) {
-        if (eventsUpdater.isRequired()) {
-            eventsUpdater.update()
-        }
+        eventsUpdater.update()
 
         for (drawer in drawers) {
             drawer.draw(canvas)
@@ -38,26 +37,25 @@ internal class CalendarRenderer(
 
 private class SingleEventsUpdater(
     private val viewState: ViewState,
-    private val chipsCache: EventChipsCache,
+    private val chipsCacheProvider: EventChipsCacheProvider,
     private val eventLabels: ArrayMap<String, StaticLayout>
 ) : Updater {
 
     private val boundsCalculator = EventChipBoundsCalculator(viewState)
     private val textFitter = TextFitter(viewState)
 
-    override fun isRequired() = true
-
     override fun update() {
-        chipsCache.clearSingleEventsCache()
+        val chipsCache = chipsCacheProvider()
+        chipsCache?.clearSingleEventsCache()
 
         for ((date, startPixel) in viewState.dateRangeWithStartPixels) {
             // If we use a horizontal margin in the day view, we need to offset the start pixel.
             val modifiedStartPixel = when {
-                viewState.isSingleDay -> startPixel + viewState.eventMarginHorizontal.toFloat()
+                viewState.isSingleDay -> startPixel + viewState.singleDayHorizontalPadding.toFloat()
                 else -> startPixel
             }
 
-            val eventChips = chipsCache.normalEventChipsByDate(date).filter {
+            val eventChips = chipsCache?.normalEventChipsByDate(date).orEmpty().filter {
                 it.event.isWithin(viewState.minHour, viewState.maxHour)
             }
 
@@ -86,7 +84,7 @@ private class SingleEventsUpdater(
             val availableWidth = bounds.width() - horizontalPadding
             val availableHeight = bounds.height() - verticalPadding
             if (availableHeight <= 0 || availableWidth <= 0) {
-                eventChip.setEmpty()
+                // We can't fit any text into this
                 continue
             }
 
@@ -104,12 +102,7 @@ private class SingleEventsUpdater(
     }
 
     private val RectF.isValid: Boolean
-        get() {
-            val hasCorrectWidth = left < right && left < viewState.viewWidth
-            val hasCorrectHeight = top < viewState.viewHeight
-            val isNotHiddenByChrome = right > viewState.timeColumnWidth && bottom > viewState.headerHeight
-            return hasCorrectWidth && hasCorrectHeight && isNotHiddenByChrome
-        }
+        get() = viewState.calendarGridBounds.intersects(this)
 }
 
 private class DayBackgroundDrawer(
@@ -136,32 +129,20 @@ private class DayBackgroundDrawer(
         startPixel: Float,
         canvas: Canvas
     ) {
-        val endPixel = startPixel + viewState.dayWidth
-        val isCompletelyHiddenByTimeColumn = endPixel <= viewState.timeColumnWidth
-        if (isCompletelyHiddenByTimeColumn) {
-            return
-        }
-
-        val actualStartPixel = max(startPixel, viewState.timeColumnWidth)
+        val actualStartPixel = max(startPixel, viewState.calendarGridBounds.left)
         val height = viewState.viewHeight.toFloat()
 
-        if (viewState.showDistinctPastFutureColor) {
-            val useWeekendColor = day.isWeekend && viewState.showDistinctWeekendColor
-            val pastPaint = viewState.getPastBackgroundPaint(useWeekendColor)
-            val futurePaint = viewState.getFutureBackgroundPaint(useWeekendColor)
+        // If not specified, this will use the normal day background.
+        val pastPaint = viewState.getPastBackgroundPaint(isWeekend = day.isWeekend)
+        val futurePaint = viewState.getFutureBackgroundPaint(isWeekend = day.isWeekend)
 
-            val startY = viewState.headerHeight + viewState.currentOrigin.y
-            val endX = startPixel + viewState.dayWidth
+        val startY = viewState.headerHeight + viewState.currentOrigin.y
+        val endX = startPixel + viewState.dayWidth
 
-            when {
-                day.isToday -> drawPastAndFutureRect(actualStartPixel, startY, endX, pastPaint, futurePaint, height, canvas)
-                day.isBeforeToday -> canvas.drawRect(actualStartPixel, startY, endX, height, pastPaint)
-                else -> canvas.drawRect(actualStartPixel, startY, endX, height, futurePaint)
-            }
-        } else {
-            val todayPaint = viewState.getDayBackgroundPaint(day.isToday)
-            val right = startPixel + viewState.dayWidth
-            canvas.drawRect(actualStartPixel, viewState.headerHeight, right, height, todayPaint)
+        when {
+            day.isToday -> drawPastAndFutureRect(actualStartPixel, startY, endX, pastPaint, futurePaint, height, canvas)
+            day.isBeforeToday -> canvas.drawRect(actualStartPixel, startY, endX, height, pastPaint)
+            else -> canvas.drawRect(actualStartPixel, startY, endX, height, futurePaint)
         }
     }
 
@@ -202,10 +183,6 @@ private class BackgroundGridDrawer(
 
     private fun Canvas.drawDaySeparators() {
         for (startPixel in viewState.startPixels) {
-            if (viewState.showTimeColumnSeparator && startPixel == viewState.timeColumnWidth) {
-                continue
-            }
-
             drawVerticalLine(
                 horizontalOffset = startPixel,
                 startY = viewState.headerHeight,
@@ -224,10 +201,11 @@ private class BackgroundGridDrawer(
     private fun Canvas.drawHourLine(hour: Int) {
         val heightOfHour = (viewState.hourHeight * (hour - viewState.minHour))
         val verticalOffset = viewState.headerHeight + viewState.currentOrigin.y + heightOfHour
+        val horizontalOffset = if (viewState.isLtr) viewState.timeColumnWidth else 0f
 
         drawHorizontalLine(
             verticalOffset = verticalOffset,
-            startX = viewState.timeColumnWidth,
+            startX = horizontalOffset,
             endX = viewState.viewWidth.toFloat(),
             paint = viewState.hourSeparatorPaint
         )
@@ -236,7 +214,7 @@ private class BackgroundGridDrawer(
 
 private class SingleEventsDrawer(
     private val viewState: ViewState,
-    private val chipsCache: EventChipsCache,
+    private val chipsCacheProvider: EventChipsCacheProvider,
     private val eventLabels: ArrayMap<String, StaticLayout>
 ) : Drawer {
 
@@ -251,9 +229,11 @@ private class SingleEventsDrawer(
     }
 
     private fun Canvas.drawEventsForDate(date: Calendar) {
-        val eventChips = chipsCache.normalEventChipsByDate(date).filterNot { it.bounds.isEmpty }
-        for (eventChip in eventChips) {
-            val textLayout = eventLabels[eventChip.id] ?: continue
+        val eventChips = chipsCacheProvider()?.normalEventChipsByDate(date).orEmpty()
+        val validEventChips = eventChips.filterNot { it.bounds.isEmpty }
+
+        for (eventChip in validEventChips) {
+            val textLayout = eventLabels[eventChip.id]
             eventChipDrawer.draw(eventChip, canvas = this, textLayout)
         }
     }
@@ -285,8 +265,9 @@ private class NowLineDrawer(
         val portionOfDayInPixels = portionOfDay * viewState.hourHeight
         val verticalOffset = top + portionOfDayInPixels
 
-        val startX = max(startPixel, viewState.timeColumnWidth)
-        val endX = startPixel + viewState.dayWidth
+        val startX = max(startPixel, viewState.calendarGridBounds.left)
+        val endX = min(startPixel + viewState.dayWidth, viewState.calendarGridBounds.right)
+
         drawLine(startX, verticalOffset, endX, verticalOffset, viewState.nowLinePaint)
 
         if (viewState.showNowLineDot) {
@@ -294,17 +275,27 @@ private class NowLineDrawer(
         }
     }
 
-    private fun Canvas.drawDot(startPixel: Float, lineStartY: Float) {
+    private fun Canvas.drawDot(startPixel: Float, lineVerticalOffset: Float) {
         val dotRadius = viewState.nowDotPaint.strokeWidth
-        val actualStartPixel = max(startPixel, viewState.timeColumnWidth)
-
         val fullLineWidth = viewState.dayWidth
-        val actualEndPixel = startPixel + fullLineWidth
 
-        val currentlyDisplayedWidth = actualEndPixel - actualStartPixel
+        val lineStartX = if (viewState.isLtr) {
+            max(startPixel, viewState.calendarGridBounds.left)
+        } else {
+            startPixel
+        }
+
+        val lineEndX = if (viewState.isLtr) {
+            startPixel + fullLineWidth
+        } else {
+            min(startPixel + fullLineWidth, viewState.calendarGridBounds.right)
+        }
+
+        val currentlyDisplayedWidth = lineEndX - lineStartX
         val currentlyDisplayedPortion = currentlyDisplayedWidth / fullLineWidth
 
         val adjustedRadius = currentlyDisplayedPortion * dotRadius
-        drawCircle(actualStartPixel, lineStartY, adjustedRadius, viewState.nowDotPaint)
+        val horizontalOffset = if (viewState.isLtr) lineStartX else lineEndX
+        drawCircle(horizontalOffset, lineVerticalOffset, adjustedRadius, viewState.nowDotPaint)
     }
 }

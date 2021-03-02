@@ -33,7 +33,7 @@ internal class TextFitter(
     private fun EventChip.fitText(availableWidth: Int, availableHeight: Int): StaticLayout {
         val textPaint = viewState.getTextPaint(event)
 
-        var text = getText(includeLocation = true)
+        var text = getText(includeSubtitle = true)
         var textLayout = text.toTextLayout(textPaint, width = availableWidth)
 
         val fitsCompletely = textLayout.height <= availableHeight
@@ -41,7 +41,7 @@ internal class TextFitter(
             return textLayout
         }
 
-        text = getText(includeLocation = false)
+        text = getText(includeSubtitle = false)
         textLayout = text.toTextLayout(textPaint, width = availableWidth)
 
         val titleOnlyFits = textLayout.height <= availableHeight
@@ -52,8 +52,8 @@ internal class TextFitter(
         while (textLayout.height > availableHeight && textLayout.lineCount > 1) {
             // Remove the last lines until there's only a single line left. If it doesn't fit
             // by that point, we need to reduce the text size.
-            val lineStart = textLayout.getLineStart(textLayout.lineCount)
-            text = text.subSequence(0, lineStart).trim()
+            val startOfLastLine = textLayout.getLineStart(textLayout.lineCount)
+            text = text.substring(startIndex = 0, endIndex = startOfLastLine - 1).trim()
             textLayout = text.toTextLayout(textPaint, width = availableWidth)
         }
 
@@ -66,22 +66,20 @@ internal class TextFitter(
         return textLayout
     }
 
-    private fun EventChip.getText(includeLocation: Boolean = false): CharSequence {
-        return if (event.isAllDay) {
-            val title = event.title.emojified
-            combineTitleAndLocation(title, location = null, isMultiLine = false)
-        } else {
-            val title = event.title.emojified
-            val location = event.location?.emojified.takeIf { includeLocation }
-            combineTitleAndLocation(title, location, isMultiLine = true)
-        }
+    private fun EventChip.getText(includeSubtitle: Boolean = false): CharSequence {
+        val subtitle = event.subtitle?.takeIf { event.isNotAllDay && includeSubtitle }
+        return combineTitleAndSubtitle(
+            title = event.title,
+            subtitle = subtitle,
+            isMultiLine = event.isNotAllDay
+        )
     }
 
-    private fun combineTitleAndLocation(
+    private fun combineTitleAndSubtitle(
         title: CharSequence,
-        location: CharSequence?,
+        subtitle: CharSequence?,
         isMultiLine: Boolean
-    ): CharSequence = when (location) {
+    ): CharSequence = when (subtitle) {
         null -> title
         else -> {
             val separator = if (isMultiLine) "\n" else " "
@@ -89,7 +87,7 @@ internal class TextFitter(
             spannableStringBuilder
                 .append(title)
                 .append(separator)
-                .append(location)
+                .append(subtitle)
                 .build()
         }
     }

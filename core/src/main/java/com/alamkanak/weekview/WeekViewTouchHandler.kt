@@ -1,8 +1,6 @@
 package com.alamkanak.weekview
 
 import java.util.Calendar
-import kotlin.math.ceil
-import kotlin.math.max
 
 internal class WeekViewTouchHandler(
     private val viewState: ViewState
@@ -12,6 +10,14 @@ internal class WeekViewTouchHandler(
 
     fun handleClick(x: Float, y: Float) {
         val inCalendarArea = x > viewState.timeColumnWidth
+        val inAllDayEventsToggleArea = viewState.toggleAllDayEventsAreaBounds.contains(x, y)
+
+        if (inAllDayEventsToggleArea && viewState.showAllDayEventsToggleArrow) {
+            viewState.allDayEventsExpanded = !viewState.allDayEventsExpanded
+            adapter?.updateObserver()
+            return
+        }
+
         if (!inCalendarArea) {
             return
         }
@@ -19,7 +25,7 @@ internal class WeekViewTouchHandler(
         val handled = adapter?.handleClick(x, y) ?: false
         if (!handled && y > viewState.headerHeight) {
             val time = calculateTimeFromPoint(x, y) ?: return
-            adapter?.handleEmptyViewClick(time)
+            adapter?.onEmptyViewClick(time)
         }
     }
 
@@ -31,7 +37,8 @@ internal class WeekViewTouchHandler(
 
         val handled = adapter?.handleLongClick(x, y) ?: false
         if (!handled && y > viewState.headerHeight) {
-            adapter?.handleLongClick(x, y)
+            val time = calculateTimeFromPoint(x, y) ?: return
+            adapter?.onEmptyViewLongClick(time)
         }
     }
 
@@ -46,27 +53,13 @@ internal class WeekViewTouchHandler(
         touchX: Float,
         touchY: Float
     ): Calendar? {
-        val totalDayWidth = viewState.dayWidth
-        val originX = viewState.currentOrigin.x
-        val timeColumnWidth = viewState.timeColumnWidth
+        val dateRange = viewState.dateRangeWithStartPixels
 
-        val daysFromOrigin = (ceil((originX / totalDayWidth).toDouble()) * -1).toInt()
-        var startPixel = originX + daysFromOrigin * totalDayWidth + timeColumnWidth
+        for ((date, startPixel) in dateRange) {
+            val endPixel = startPixel + viewState.dayWidth
+            val isWithinDay = touchX in startPixel..endPixel
 
-        val firstDay = daysFromOrigin + 1
-        val lastDay = firstDay + viewState.numberOfVisibleDays
-
-        for (dayNumber in firstDay..lastDay) {
-            val start = max(startPixel, timeColumnWidth)
-            val end = startPixel + totalDayWidth
-            val width = end - start
-
-            val isVisibleHorizontally = width > 0
-            val isWithinDay = touchX in start..end
-
-            if (isVisibleHorizontally && isWithinDay) {
-                val day = now() + Days(dayNumber - 1)
-
+            if (isWithinDay) {
                 val hourHeight = viewState.hourHeight
                 val pixelsFromMidnight = touchY - viewState.currentOrigin.y - viewState.headerHeight
                 val hour = (pixelsFromMidnight / hourHeight).toInt()
@@ -74,10 +67,8 @@ internal class WeekViewTouchHandler(
                 val pixelsFromFullHour = pixelsFromMidnight - hour * hourHeight
                 val minutes = ((pixelsFromFullHour / hourHeight) * 60).toInt()
 
-                return day.withTime(viewState.minHour + hour, minutes)
+                return date.withTime(viewState.minHour + hour, minutes)
             }
-
-            startPixel += totalDayWidth
         }
 
         return null

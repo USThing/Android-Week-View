@@ -3,6 +3,7 @@ package com.alamkanak.weekview
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
+import java.util.TimeZone
 import kotlin.math.roundToInt
 
 internal const val DAY_IN_MILLIS = 1000L * 60L * 60L * 24L
@@ -194,7 +195,10 @@ internal fun firstDayOfYear(): Calendar {
 
 internal typealias DateRange = List<Calendar>
 
-internal fun DateRange.limitTo(minDate: Calendar?, maxDate: Calendar?): List<Calendar> {
+internal fun DateRange.validate(viewState: ViewState): List<Calendar> {
+    val minDate = viewState.minDate
+    val maxDate = viewState.maxDate
+
     if (minDate == null && maxDate == null) {
         return this
     }
@@ -214,19 +218,17 @@ internal fun DateRange.limitTo(minDate: Calendar?, maxDate: Calendar?): List<Cal
 
     return when {
         mustAdjustStart -> {
-            minDate!!.rangeWithDays(numberOfDays)
+            viewState.createDateRange(minDate!!)
         }
         mustAdjustEnd -> {
             val start = maxDate!! - Days(numberOfDays - 1)
-            start.rangeWithDays(numberOfDays)
+            viewState.createDateRange(start)
         }
         else -> {
             this
         }
     }
 }
-
-internal fun Calendar.rangeWithDays(days: Int) = (0 until days).map { this + Days(it) }
 
 internal val Calendar.isWeekend: Boolean
     get() = dayOfWeek == Calendar.SATURDAY || dayOfWeek == Calendar.SUNDAY
@@ -260,6 +262,13 @@ internal fun Calendar.withMinutes(minute: Int): Calendar {
     return copy().apply { set(Calendar.MINUTE, minute) }
 }
 
+internal fun Calendar.withLocalTimeZone(): Calendar {
+    val localTimeZone = TimeZone.getDefault()
+    val localCalendar = Calendar.getInstance(localTimeZone)
+    localCalendar.timeInMillis = timeInMillis
+    return localCalendar
+}
+
 internal fun Calendar.copy(): Calendar = clone() as Calendar
 
 /**
@@ -288,9 +297,7 @@ internal fun defaultDateFormatter(
 
 internal fun defaultTimeFormatter(): SimpleDateFormat = SimpleDateFormat("hh a", Locale.getDefault())
 
-internal fun Calendar.format(
-    format: Int = java.text.DateFormat.MEDIUM
-): String {
-    val sdf = SimpleDateFormat.getDateInstance(format)
+internal fun Calendar.format(): String {
+    val sdf = SimpleDateFormat.getDateTimeInstance()
     return sdf.format(time)
 }

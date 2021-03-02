@@ -4,7 +4,12 @@ import java.util.Calendar
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
+internal typealias EventChipsCacheProvider = () -> EventChipsCache?
+
 internal class EventChipsCache {
+
+    val eventIds: Set<Long>
+        get() = allEventChips.map { it.originalEvent.id }.toSet()
 
     val allEventChips: List<EventChip>
         get() = normalEventChipsByDate.values.flatten() + allDayEventChipsByDate.values.flatten()
@@ -41,8 +46,13 @@ internal class EventChipsCache {
         return results
     }
 
-    private fun put(newChips: List<EventChip>) {
-        for (eventChip in newChips) {
+    fun replaceAll(eventChips: List<EventChip>) {
+        clear()
+        addAll(eventChips)
+    }
+
+    fun addAll(eventChips: List<EventChip>) {
+        for (eventChip in eventChips) {
             val key = eventChip.event.startTime.atStartOfDay.timeInMillis
             if (eventChip.event.isAllDay) {
                 allDayEventChipsByDate.addOrReplace(key, eventChip)
@@ -51,8 +61,6 @@ internal class EventChipsCache {
             }
         }
     }
-
-    operator fun plusAssign(newChips: List<EventChip>) = put(newChips)
 
     fun findHitEvent(x: Float, y: Float): EventChip? {
         val candidates = allEventChips.filter { it.isHit(x, y) }
